@@ -8,7 +8,7 @@ on:
         required: true
         default: '21.3-Omega'
       keep_releases:
-        description: 'Number of old releases to keep'
+        description: 'Number of old releases to keep (0 to disable cleanup)'
         required: false
         default: '3'
 
@@ -40,7 +40,8 @@ jobs:
           squashfs-tools \
           unsquashfs \
           mount \
-          kpartx
+          kpartx \
+          jq
         sudo apt-get autoremove -y
         sudo apt-get clean
         sudo timedatectl set-timezone "$TZ"
@@ -52,7 +53,7 @@ jobs:
     
     - name: Run build script
       env:
-        VERSION: ${{ inputs.version }}
+        VERSION: ${{ github.event.inputs.version }}
       run: |
         chmod +x build.sh
         ./build.sh "$VERSION"
@@ -105,14 +106,42 @@ jobs:
         draft: false
         prerelease: false
     
-    - name: Clean up old releases
-      if: ${{ inputs.keep_releases > 0 }}
-      uses: dev-drprasad/delete-older-releases@v1.0.2
-      with:
-        keep_latest: ${{ inputs.keep_releases }}
-        delete_tag_pattern: 'v.*-.*'  # Match release tags
+    - name: Clean up old releases (using GH CLI)
+      # 修复条件判断：当 keep_releases 存在且不等于 '0' 时执行
+      if: ${{ github.event.inputs.keep_releases && github.event.inputs.keep_releases != '0' }}
       env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        KEEP_COUNT: ${{ github.event.inputs.keep_releases }}
+      run: |
+        echo "Starting cleanup: keeping latest $KEEP_COUNT release(s)"
+        
+        # 获取所有 releases，按创建时间降序排序
+        releases_json=$(gh release list --json tagName,createdAt --limit 50 --order desc)
+        
+        # 提取标签名到数组
+        all_tags=()
+        while IFS= read -r tag; do
+          all_tags+=("$tag")
+        done < <(echo "$releases_json" | jq -r '.[].tagName')
+        
+        echo "Total releases found: ${#all_tags[@]}"
+        
+        # 删除超过保留数量的旧发布
+        for (( i=KEEP_COUNT; i<${#all_tags[@]}; i++ )); do
+          tag="${all_tags[$i]}"
+          # 只删除匹配特定模式的标签（v开头，包含日期）
+          if [[ "$tag" =~ ^v.*-.* ]]; then
+            echo "Deleting old release: $tag"
+            # 先尝试删除 release，如果失败则尝试删除 tag
+            if gh release delete "$tag" --yes; then
+              echo "Successfully deleted release: $tag"
+            else
+              echo "Failed to delete release $tag, it might not exist or already deleted"
+            fi
+          fi
+        done
+        
+        echo "Cleanup completed"
     
     - name: Clean up build directory
       if: always()
